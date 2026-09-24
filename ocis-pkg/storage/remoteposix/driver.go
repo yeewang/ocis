@@ -361,6 +361,9 @@ func (d *Driver) ListStorageSpaces(ctx context.Context, filters []*provider.List
 		return nil, e
 	}
 	sp := &provider.StorageSpace{Id: &provider.StorageSpaceId{OpaqueId: d.s.spaceID}, Name: d.c.SpaceName, SpaceType: "project", Root: d.id(n.ID), RootInfo: ri, Owner: &userpb.User{Id: d.owner()}, Mtime: ri.Mtime, Opaque: utils.AppendPlainToOpaque(nil, "spaceAlias", "project/"+d.s.spaceID)}
+	if e := d.addSpaceMembership(sp); e != nil {
+		return nil, e
+	}
 	for _, f := range filters {
 		if id := f.GetId(); id != nil && id.OpaqueId != d.s.spaceID {
 			return []*provider.StorageSpace{}, nil

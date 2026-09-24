@@ -1,0 +1,7 @@
+**
+!dist/
+!dist/binaries/
+!dist/binaries/ocis-linux-amd64
+!docker/
+!docker/Dockerfile.remoteposix
+!docker/Dockerfile.remoteposix.dockerignore

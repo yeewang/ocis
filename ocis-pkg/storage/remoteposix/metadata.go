@@ -3,14 +3,56 @@ package remoteposix
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 
 	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
 	"github.com/google/uuid"
 	"github.com/owncloud/reva/v2/pkg/errtypes"
+	"github.com/owncloud/reva/v2/pkg/utils"
 	"google.golang.org/protobuf/proto"
 )
+
+// addSpaceMembership exposes the root grants consumed by Graph and Web when
+// deciding which actions a project-space member can perform.
+func (d *Driver) addSpaceMembership(sp *provider.StorageSpace) error {
+	attrs, err := d.attributes(d.s.spaceID, "grant:")
+	if err != nil {
+		return err
+	}
+	permissions := map[string]*provider.ResourcePermissions{}
+	groups := map[string]struct{}{}
+	for _, data := range attrs {
+		grant := &provider.Grant{}
+		if err := proto.Unmarshal(data, grant); err != nil {
+			return err
+		}
+		var id string
+		if user := grant.Grantee.GetUserId(); user != nil && user.Idp == d.c.OwnerIDP {
+			id = user.OpaqueId
+		} else if group := grant.Grantee.GetGroupId(); group != nil && group.Idp == d.c.OwnerIDP {
+			id = group.OpaqueId
+			groups[id] = struct{}{}
+		}
+		if id == "" {
+			continue
+		}
+		permissions[id] = grant.Permissions
+		if permissions[id] == nil {
+			permissions[id] = &provider.ResourcePermissions{}
+		}
+	}
+	permissions[d.c.OwnerID] = fullPermissions()
+	for key, value := range map[string]interface{}{"grants": permissions, "groups": groups} {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		sp.Opaque = utils.AppendPlainToOpaque(sp.Opaque, key, string(data))
+	}
+	return nil
+}
 
 func (d *Driver) attributes(id, prefix string) (map[string][]byte, error) {
 	rows, e := d.s.reader().Query("SELECT key,value FROM attributes WHERE node=? AND substr(key,1,?)=?", id, len(prefix), prefix)

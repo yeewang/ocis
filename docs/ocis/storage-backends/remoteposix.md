@@ -22,6 +22,52 @@ go test -race ./ocis-pkg/storage/remoteposix ./services/storage-users/pkg/revaco
 
 ## Configure
 
+### Docker image
+
+From the repository root, build the complete Web UI and the Linux amd64 binary
+with CGO SQLite and VIPS enabled, then package the runtime:
+
+```sh
+docker build --platform linux/amd64 \
+  -f ocis/docker/Dockerfile.remoteposix.build \
+  --build-arg VERSION=8.2.0-remoteposix.3-alpine \
+  --build-arg REVISION="$(git rev-parse HEAD)" \
+  --output type=local,dest=ocis/dist/binaries .
+docker build --platform linux/amd64 \
+  -f ocis/docker/Dockerfile.remoteposix \
+  --build-arg VERSION=8.2.0-remoteposix.3-alpine \
+  --build-arg REVISION="$(git rev-parse HEAD)" \
+  -t ocis-remoteposix:8.2.0-remoteposix.3-alpine ocis
+docker run --rm ocis-remoteposix:8.2.0-remoteposix.3-alpine version --skip-services
+```
+
+The runtime Dockerfile is an exact copy of `ocis/docker/Dockerfile.linux.amd64`:
+`amd64/alpine:3.24.2`, all original packages (including `vips=8.18.2-r0`), labels,
+UID/GID 1000, permissions, volumes, working directory, port and entrypoint are
+preserved. The binary is compiled against Alpine musl with the release build's
+tags and default configuration/data paths. The embedded Web UI, login assets,
+translations and standard oCIS services are included. Its default command is
+`server`. `Dockerfile.remoteposix.dockerignore` limits the runtime build context;
+the original runtime Dockerfile can also be used with the same binary.
+The driver is included but is selected through the configuration below; ordinary
+oCIS initialization and deployment configuration are still required.
+
+For a Linux deployment, bind-mount the already mounted remote tree at
+`/mnt/remote`, and configure that path as the driver root. Persist `/etc/ocis`
+and `/var/lib/ocis` on local storage. Set the driver state directory to a local
+path such as `/var/lib/ocis/remoteposix/team`; never place it inside the remote
+mount. Grant UID/GID 1000 access to these paths before starting the container.
+Providers for the same root must share the same local state directory and mount
+namespace view of the remote root. The image does not mount NFS/SMB itself.
+
+An exported Docker archive can be imported with:
+
+```sh
+docker load -i ocis-remoteposix-8.2.0-remoteposix.3-alpine-linux-amd64.docker.tar
+```
+
+### Driver configuration
+
 Use an additional storage-users instance for this project space if the deployment
 also needs personal spaces. The normal oCIS gateway, authentication and storage
 registry configuration is still required; the example below only selects the
