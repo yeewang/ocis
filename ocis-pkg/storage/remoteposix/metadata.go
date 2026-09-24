@@ -13,7 +13,7 @@ import (
 )
 
 func (d *Driver) attributes(id, prefix string) (map[string][]byte, error) {
-	rows, e := d.s.db.Query("SELECT key,value FROM attributes WHERE node=? AND substr(key,1,?)=?", id, len(prefix), prefix)
+	rows, e := d.s.reader().Query("SELECT key,value FROM attributes WHERE node=? AND substr(key,1,?)=?", id, len(prefix), prefix)
 	if e != nil {
 		return nil, e
 	}
@@ -151,7 +151,7 @@ func grantKey(g *provider.Grantee) (string, error) {
 	return "grant:" + base64.RawURLEncoding.EncodeToString(b), e
 }
 func (d *Driver) changeGrant(ctx context.Context, ref *provider.Reference, g *provider.Grant, remove bool) error {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{ref, true})
 	if e != nil {
 		return e
 	}
@@ -194,7 +194,7 @@ func (d *Driver) DenyGrant(ctx context.Context, r *provider.Reference, g *provid
 	return d.changeGrant(ctx, r, &provider.Grant{Grantee: g}, false)
 }
 func (d *Driver) ListGrants(ctx context.Context, r *provider.Reference) ([]*provider.Grant, error) {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{r, false})
 	if e != nil {
 		return nil, e
 	}
@@ -222,7 +222,7 @@ func (d *Driver) ListGrants(ctx context.Context, r *provider.Reference) ([]*prov
 }
 
 func (d *Driver) editMetadata(ctx context.Context, r *provider.Reference, set map[string]string, remove []string) error {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{r, true})
 	if e != nil {
 		return e
 	}
@@ -255,7 +255,7 @@ func (d *Driver) editMetadata(ctx context.Context, r *provider.Reference, set ma
 	if _, e = tx.Exec("UPDATE nodes SET etag=? WHERE id=?", uuid.NewString(), n.ID); e != nil {
 		return e
 	}
-	if e = refreshDirectories(tx); e != nil {
+	if e = refreshDirectories(tx, n.Path); e != nil {
 		return e
 	}
 	return tx.Commit()

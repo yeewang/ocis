@@ -38,7 +38,7 @@ func (d *Driver) session(ctx context.Context, id string) (session, error) {
 		return s, tusd.ErrNotFound
 	}
 	var b []byte
-	if e := d.s.db.QueryRow("SELECT body FROM uploads WHERE id=?", id).Scan(&b); e != nil {
+	if e := d.s.reader().QueryRow("SELECT body FROM uploads WHERE id=?", id).Scan(&b); e != nil {
 		return s, mapError(e)
 	}
 	if e := json.Unmarshal(b, &s); e != nil {
@@ -67,7 +67,7 @@ func (d *Driver) saveSession(s session) error {
 func (d *Driver) stage(id string) string { return filepath.Join(d.s.state, "staging", id) }
 
 func (d *Driver) start(ctx context.Context, ref *provider.Reference, info tusd.FileInfo) (tusd.Upload, error) {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{ref, true})
 	if e != nil {
 		return nil, e
 	}
@@ -158,7 +158,7 @@ func (d *Driver) NewUpload(ctx context.Context, info tusd.FileInfo) (tusd.Upload
 	return d.start(ctx, &provider.Reference{ResourceId: d.id(d.s.spaceID), Path: path.Join(info.MetaData["dir"], info.MetaData["filename"])}, info)
 }
 func (d *Driver) GetUpload(ctx context.Context, id string) (tusd.Upload, error) {
-	u, e := d.begin(ctx)
+	u, e := d.beginSession(ctx, id)
 	if e != nil {
 		return nil, e
 	}
@@ -179,7 +179,7 @@ func (d *Driver) AsLengthDeclarableUpload(u tusd.Upload) tusd.LengthDeclarableUp
 }
 
 func (u *upload) GetInfo(ctx context.Context) (tusd.FileInfo, error) {
-	unlock, e := u.d.begin(ctx)
+	unlock, e := u.d.beginSession(ctx, u.id)
 	if e != nil {
 		return tusd.FileInfo{}, e
 	}
@@ -188,7 +188,7 @@ func (u *upload) GetInfo(ctx context.Context) (tusd.FileInfo, error) {
 	return s.Info, e
 }
 func (u *upload) WriteChunk(ctx context.Context, offset int64, r io.Reader) (int64, error) {
-	unlock, e := u.d.begin(ctx)
+	unlock, e := u.d.beginSession(ctx, u.id)
 	if e != nil {
 		return 0, e
 	}
@@ -228,19 +228,30 @@ func (u *upload) WriteChunk(ctx context.Context, offset int64, r io.Reader) (int
 	s.Info.Offset += n
 	return n, u.d.saveSession(s)
 }
+
+type stagedReader struct {
+	io.Reader
+	io.Closer
+}
+
 func (u *upload) GetReader(ctx context.Context) (io.ReadCloser, error) {
-	unlock, e := u.d.begin(ctx)
+	unlock, e := u.d.beginSession(ctx, u.id)
 	if e != nil {
 		return nil, e
 	}
 	defer unlock()
-	if _, e = u.d.session(ctx, u.id); e != nil {
+	session, e := u.d.session(ctx, u.id)
+	if e != nil {
 		return nil, e
 	}
-	return os.Open(u.d.stage(u.id))
+	f, e := os.Open(u.d.stage(u.id))
+	if e != nil {
+		return nil, e
+	}
+	return &stagedReader{Reader: io.LimitReader(f, session.Info.Offset), Closer: f}, nil
 }
 func (u *upload) DeclareLength(ctx context.Context, size int64) error {
-	unlock, e := u.d.begin(ctx)
+	unlock, e := u.d.beginSession(ctx, u.id)
 	if e != nil {
 		return e
 	}
@@ -257,7 +268,7 @@ func (u *upload) DeclareLength(ctx context.Context, size int64) error {
 	return u.d.saveSession(s)
 }
 func (u *upload) Terminate(ctx context.Context) error {
-	unlock, e := u.d.begin(ctx)
+	unlock, e := u.d.beginSession(ctx, u.id)
 	if e != nil {
 		return e
 	}
@@ -272,7 +283,104 @@ func (u *upload) Terminate(ctx context.Context) error {
 	return e
 }
 
+// prepare copies bytes without holding destination or ancestor locks.
+func (d *Driver) prepare(ctx context.Context, r io.Reader, length int64, sessionID string) (string, error) {
+	if length < 0 || length == int64(^uint64(0)>>1) {
+		return "", errtypes.BadRequest("invalid upload length")
+	}
+	// Temporary files are on the same mounted filesystem as the destination.
+	tmp := path.Join(control, "tmp", uuid.NewString())
+	f, e := d.s.root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if e != nil {
+		return "", e
+	}
+	complete := false
+	defer func() {
+		if !complete {
+			_ = d.s.root.Remove(tmp)
+		}
+	}()
+	count, e := io.Copy(f, io.LimitReader(r, length+1))
+	if e == nil && count != length {
+		e = errtypes.BadRequest("upload size mismatch")
+	}
+	if e == nil {
+		e = f.Sync()
+	}
+	ce := f.Close()
+	if e == nil {
+		e = ce
+	}
+	if e != nil {
+		_ = d.s.root.Remove(tmp)
+		return "", e
+	}
+	if sessionID != "" {
+		upload, err := d.session(ctx, sessionID)
+		if err != nil {
+			return "", err
+		}
+		if value := upload.Info.MetaData["mtime"]; value != "" {
+			seconds, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return "", err
+			}
+			mtime := time.Unix(seconds, 0)
+			if err = d.s.root.Chtimes(tmp, mtime, mtime); err != nil {
+				return "", err
+			}
+			synced, err := d.s.root.Open(tmp)
+			if err != nil {
+				return "", err
+			}
+			err = synced.Sync()
+			closeErr := synced.Close()
+			if err != nil {
+				return "", err
+			}
+			if closeErr != nil {
+				return "", closeErr
+			}
+		}
+	}
+	complete = true
+	return tmp, nil
+}
 func (d *Driver) write(ctx context.Context, parent nodeRecord, name string, r io.Reader, length int64, expectedID, expectedETag string, sessionIDs ...string) (nodeRecord, error) {
+	sessionID := ""
+	if len(sessionIDs) > 0 {
+		sessionID = sessionIDs[0]
+	}
+	tmp := ""
+	if sessionID != "" {
+		var err error
+		tmp, err = d.prepare(ctx, r, length, sessionID)
+		if err != nil {
+			return nodeRecord{}, err
+		}
+		// The session lock precedes all resource locks. Re-resolve the parent's
+		// stable ID after transfer, so directory moves cannot publish to stale paths.
+		release, err := d.beginRefs(ctx, lockRef{&provider.Reference{ResourceId: d.id(parent.ID), Path: name}, true})
+		if err != nil {
+			_ = d.s.root.Remove(tmp)
+			return nodeRecord{}, err
+		}
+		defer release()
+		parent, err = d.s.byID(parent.ID)
+		if err != nil || !public(parent) {
+			_ = d.s.root.Remove(tmp)
+			return nodeRecord{}, errtypes.NotFound("upload parent")
+		}
+	}
+	// Remove only unjournaled temporary content. A failed durable operation owns it.
+	defer func() {
+		if tmp != "" {
+			var count int
+			if err := d.s.reader().QueryRow("SELECT count(*) FROM operations WHERE json_extract(body,'$.Source')=?", tmp).Scan(&count); err == nil && count == 0 {
+				_ = d.s.root.Remove(tmp)
+			}
+		}
+	}()
 	if length < 0 || length == int64(^uint64(0)>>1) {
 		return nodeRecord{}, errtypes.BadRequest("invalid upload length")
 	}
@@ -313,46 +421,11 @@ func (d *Driver) write(ctx context.Context, parent nodeRecord, name string, r io
 			n.ID = upload.Info.Storage["NodeId"]
 		}
 	}
-	// Temporary files are on the same mounted filesystem as the destination.
-	tmp := path.Join(control, "tmp", uuid.NewString())
-	f, e := d.s.root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if e != nil {
-		return n, e
-	}
-	count, e := io.Copy(f, io.LimitReader(r, length+1))
-	if e == nil && count != length {
-		e = errtypes.BadRequest("upload size mismatch")
-	}
-	if e == nil {
-		e = f.Sync()
-	}
-	ce := f.Close()
-	if e == nil {
-		e = ce
-	}
-	if e != nil {
-		_ = d.s.root.Remove(tmp)
-		return n, e
-	}
-	if len(sessionIDs) > 0 && sessionIDs[0] != "" {
-		upload, err := d.session(ctx, sessionIDs[0])
-		if err != nil {
-			return n, err
+	if tmp == "" {
+		tmp, e = d.prepare(ctx, r, length, sessionID)
+		if e != nil {
+			return n, e
 		}
-		if value := upload.Info.MetaData["mtime"]; value != "" {
-			seconds, err := strconv.ParseInt(value, 10, 64)
-			if err != nil {
-				return n, err
-			}
-			mtime := time.Unix(seconds, 0)
-			if err = d.s.root.Chtimes(tmp, mtime, mtime); err != nil {
-				return n, err
-			}
-		}
-	}
-	sessionID := ""
-	if len(sessionIDs) > 0 {
-		sessionID = sessionIDs[0]
 	}
 	e = d.s.apply(ctx, operation{ID: uuid.NewString(), Kind: kind, Source: tmp, Target: p, Node: n, Session: sessionID})
 	if e != nil {
@@ -362,11 +435,12 @@ func (d *Driver) write(ctx context.Context, parent nodeRecord, name string, r io
 }
 func (u *upload) FinishUpload(ctx context.Context) error {
 	d := u.d
-	unlock, e := d.begin(ctx)
+	unlock, e := d.beginSession(ctx, u.id)
 	if e != nil {
 		return e
 	}
 	defer unlock()
+	ctx = context.WithValue(ctx, heldSessionKey{}, u.id)
 	s, e := d.session(ctx, u.id)
 	if e != nil {
 		return e
@@ -397,6 +471,18 @@ func (d *Driver) Upload(ctx context.Context, req storage.UploadRequest, finished
 	if e != nil {
 		return nil, e
 	}
+	release, e := d.beginSession(ctx, u.(*upload).id)
+	if e != nil {
+		return nil, e
+	}
+	completed, e := d.session(ctx, u.(*upload).id)
+	release()
+	if e != nil {
+		return nil, e
+	}
+	if completed.Result != "" {
+		return d.uploadResult(ctx, completed, finished)
+	}
 	i, e := u.GetInfo(ctx)
 	if e != nil {
 		return nil, e
@@ -419,7 +505,7 @@ func (d *Driver) Upload(ctx context.Context, req storage.UploadRequest, finished
 	if e = u.FinishUpload(ctx); e != nil {
 		return nil, e
 	}
-	unlock, e := d.begin(ctx)
+	unlock, e := d.beginSession(ctx, u.(*upload).id)
 	if e != nil {
 		return nil, e
 	}
@@ -428,6 +514,10 @@ func (d *Driver) Upload(ctx context.Context, req storage.UploadRequest, finished
 	if e != nil {
 		return nil, e
 	}
+	return d.uploadResult(ctx, s, finished)
+}
+
+func (d *Driver) uploadResult(ctx context.Context, s session, finished storage.UploadFinishedFunc) (*provider.ResourceInfo, error) {
 	ri, e := d.GetMD(ctx, d.ref(s.Result), nil, nil)
 	if e == nil && finished != nil {
 		user, _ := executant(ctx)
@@ -436,7 +526,7 @@ func (d *Driver) Upload(ctx context.Context, req storage.UploadRequest, finished
 	return ri, e
 }
 func (d *Driver) TouchFile(ctx context.Context, ref *provider.Reference, _ bool, _ string) (*storage.TouchFileResult, error) {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{ref, true})
 	if e != nil {
 		return nil, e
 	}
@@ -474,12 +564,17 @@ func (d *Driver) CommitUpload(context.Context, *provider.Reference, string, stor
 // ListUploadSessions is used by the TUS completion event consumer and the
 // storage-users upload maintenance command; it is not a public filesystem API.
 func (d *Driver) ListUploadSessions(ctx context.Context, filter storage.UploadSessionFilter) ([]storage.UploadSession, error) {
-	u, e := d.begin(ctx)
+	u, e := d.s.enter()
 	if e != nil {
 		return nil, e
 	}
 	defer u()
-	rows, e := d.s.db.Query("SELECT body FROM uploads")
+	tx, e := d.s.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if e != nil {
+		return nil, e
+	}
+	defer tx.Rollback()
+	rows, e := tx.QueryContext(ctx, "SELECT body FROM uploads")
 	if e != nil {
 		return nil, e
 	}
@@ -517,7 +612,7 @@ func (d *Driver) ListUploadSessions(ctx context.Context, filter storage.UploadSe
 		filtered := out[:0]
 		for _, v := range out {
 			sv := v.(*sessionView)
-			_, e := d.s.byID(sv.s.Info.Storage["NodeId"])
+			_, e := readNode(tx.QueryRowContext(ctx, "SELECT "+nodeColumns+" FROM nodes WHERE id=?", sv.s.Info.Storage["NodeId"]))
 			orphaned := e != nil && sv.s.Result != ""
 			if orphaned == *filter.Orphaned {
 				filtered = append(filtered, v)
@@ -546,7 +641,7 @@ func (v *sessionView) Expires() time.Time            { return time.Unix(0, v.s.C
 func (v *sessionView) IsProcessing() bool            { return false }
 func (v *sessionView) ScanData() (string, time.Time) { return "", time.Time{} }
 func (v *sessionView) Purge(ctx context.Context) {
-	u, e := v.d.begin(ctx)
+	u, e := v.d.beginSession(ctx, v.s.Info.ID)
 	if e != nil {
 		return
 	}

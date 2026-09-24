@@ -35,26 +35,21 @@ type nodeRecord struct {
 
 type store struct {
 	db                       *sql.DB
+	readDB                   *sql.DB
 	root                     *os.Root
 	rootPath, state, spaceID string
 	mu                       sync.Mutex
 	closed                   bool
+	active                   sync.WaitGroup
 }
 
-// Every provider instance on this host shares this lock. It covers remote I/O,
-// journal recovery and SQLite commits, not just individual SQL statements.
+// Initialization only. Runtime requests use the resource locks in locks.go.
 func (s *store) lock() (func(), error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return nil, errors.New("remoteposix: store closed")
-	}
 	f, err := lockedfile.OpenFile(filepath.Join(s.state, "operations.lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		s.mu.Unlock()
 		return nil, err
 	}
-	return func() { _ = f.Close(); s.mu.Unlock() }, nil
+	return func() { _ = f.Close() }, nil
 }
 
 func openStore(rootPath, state string) (_ *store, err error) {
@@ -97,10 +92,13 @@ func openStore(rootPath, state string) (_ *store, err error) {
 			if s.db != nil {
 				_ = s.db.Close()
 			}
+			if s.readDB != nil {
+				_ = s.readDB.Close()
+			}
 		}
 	}()
 	u := url.URL{Scheme: "file", Path: filepath.ToSlash(filepath.Join(state, "metadata.sqlite"))}
-	s.db, err = sql.Open("sqlite3", u.String()+"?_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on&_busy_timeout=10000")
+	s.db, err = sql.Open("sqlite3", u.String()+"?_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on&_busy_timeout=10000&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
@@ -114,12 +112,19 @@ CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, body BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS retained (id TEXT PRIMARY KEY, node TEXT NOT NULL, path TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL, time INTEGER NOT NULL, snapshot BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, node TEXT NOT NULL, kind TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, body BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS completed_operations (id TEXT NOT NULL, kind TEXT NOT NULL, node TEXT NOT NULL, time INTEGER NOT NULL, PRIMARY KEY(id,kind));
+INSERT OR IGNORE INTO settings VALUES ('epoch','0');
+CREATE TRIGGER IF NOT EXISTS nodes_insert_epoch AFTER INSERT ON nodes BEGIN UPDATE settings SET value=CAST(value AS INTEGER)+1 WHERE key='epoch'; END;
+CREATE TRIGGER IF NOT EXISTS nodes_update_epoch AFTER UPDATE ON nodes BEGIN UPDATE settings SET value=CAST(value AS INTEGER)+1 WHERE key='epoch'; END;
+CREATE TRIGGER IF NOT EXISTS nodes_delete_epoch AFTER DELETE ON nodes BEGIN UPDATE settings SET value=CAST(value AS INTEGER)+1 WHERE key='epoch'; END;
+CREATE TRIGGER IF NOT EXISTS operations_insert_epoch AFTER INSERT ON operations BEGIN UPDATE settings SET value=CAST(value AS INTEGER)+1 WHERE key='epoch'; END;
+CREATE TRIGGER IF NOT EXISTS operations_delete_epoch AFTER DELETE ON operations BEGIN UPDATE settings SET value=CAST(value AS INTEGER)+1 WHERE key='epoch'; END;
 `)
 	if err != nil {
 		return nil, err
 	}
 	var version string
-	err = s.db.QueryRow("SELECT value FROM settings WHERE key='schema'").Scan(&version)
+	err = s.reader().QueryRow("SELECT value FROM settings WHERE key='schema'").Scan(&version)
 	if errors.Is(err, sql.ErrNoRows) {
 		// A marker binds this database to this mount, so an unavailable mount
 		// cannot be mistaken for an empty directory. It contains no file metadata.
@@ -172,14 +177,14 @@ CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, body BLOB NOT NULL);
 	} else if err != nil {
 		return nil, err
 	} else {
-		if version != "1" {
+		if version != "1" && version != "2" {
 			return nil, fmt.Errorf("unsupported metadata schema %q", version)
 		}
-		if err = s.db.QueryRow("SELECT value FROM settings WHERE key='space'").Scan(&s.spaceID); err != nil {
+		if err = s.reader().QueryRow("SELECT value FROM settings WHERE key='space'").Scan(&s.spaceID); err != nil {
 			return nil, err
 		}
 		var boundRoot string
-		if err = s.db.QueryRow("SELECT value FROM settings WHERE key='root'").Scan(&boundRoot); err != nil {
+		if err = s.reader().QueryRow("SELECT value FROM settings WHERE key='root'").Scan(&boundRoot); err != nil {
 			return nil, err
 		}
 		if boundRoot != rootPath {
@@ -189,7 +194,17 @@ CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, body BLOB NOT NULL);
 	if err = s.healthy(); err != nil {
 		return nil, err
 	}
-	if err = s.recover(context.Background()); err != nil {
+	if _, err = s.db.Exec("UPDATE settings SET value='2' WHERE key='schema'"); err != nil {
+		return nil, err
+	}
+	// Readers use deferred, query-only transactions; the writer connection
+	// uses BEGIN IMMEDIATE so read-modify-write commits never upgrade a snapshot.
+	s.readDB, err = sql.Open("sqlite3", u.String()+"?mode=ro&_query_only=on&_busy_timeout=10000")
+	if err != nil {
+		return nil, err
+	}
+	s.readDB.SetMaxOpenConns(8)
+	if err = s.readDB.Ping(); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -295,15 +310,22 @@ func readNode(r scanner) (n nodeRecord, err error) {
 
 const nodeColumns = "id,parent,name,path,dir,size,mtime,etag,missing"
 
+func (s *store) reader() *sql.DB {
+	if s.readDB != nil {
+		return s.readDB
+	}
+	return s.db // initialization before the read pool is opened
+}
+
 func (s *store) byPath(p string) (nodeRecord, error) {
-	return readNode(s.db.QueryRow("SELECT "+nodeColumns+" FROM nodes WHERE path=?", p))
+	return readNode(s.reader().QueryRow("SELECT "+nodeColumns+" FROM nodes WHERE path=?", p))
 }
 func (s *store) byID(id string) (nodeRecord, error) {
-	return readNode(s.db.QueryRow("SELECT "+nodeColumns+" FROM nodes WHERE id=?", id))
+	return readNode(s.reader().QueryRow("SELECT "+nodeColumns+" FROM nodes WHERE id=?", id))
 }
 
 func (s *store) records() ([]nodeRecord, error) {
-	rows, err := s.db.Query("SELECT " + nodeColumns + " FROM nodes ORDER BY length(path),path")
+	rows, err := s.reader().Query("SELECT " + nodeColumns + " FROM nodes ORDER BY length(path),path")
 	if err != nil {
 		return nil, err
 	}
@@ -323,6 +345,23 @@ func (s *store) records() ([]nodeRecord, error) {
 // Missing entries are retained through a grace period. A large disappearance
 // suspends the entire scan instead of deleting an uncertain subtree.
 func (s *store) scan(ctx context.Context, grace time.Duration) error {
+	leave, err := s.enter()
+	if err != nil {
+		return err
+	}
+	defer leave()
+	var epoch int64
+	if err = s.reader().QueryRowContext(ctx, "SELECT value FROM settings WHERE key='epoch'").Scan(&epoch); err != nil {
+		return err
+	}
+	ops, err := s.pending(ctx)
+	if err != nil {
+		return err
+	}
+	if len(ops) > 0 {
+		return nil
+	}
+
 	if err := s.healthy(); err != nil {
 		return err
 	}
@@ -388,10 +427,21 @@ func (s *store) scan(ctx context.Context, grace time.Duration) error {
 		return nil
 	})
 	if err != nil {
+		var current int64
+		if ctx.Err() == nil && s.reader().QueryRowContext(ctx, "SELECT value FROM settings WHERE key='epoch'").Scan(&current) == nil && current != epoch {
+			return nil
+		}
 		return err
 	}
 	if err = s.healthy(); err != nil {
 		return err
+	}
+	var observedEpoch int64
+	if err = s.reader().QueryRowContext(ctx, "SELECT value FROM settings WHERE key='epoch'").Scan(&observedEpoch); err != nil {
+		return err
+	}
+	if observedEpoch != epoch {
+		return nil
 	}
 	missing := 0
 	for _, n := range old {
@@ -402,16 +452,45 @@ func (s *store) scan(ctx context.Context, grace time.Duration) error {
 	if missing > 10 && missing*4 > len(old) {
 		return errors.New("more than 25 percent of the tree disappeared; scan suspended")
 	}
+	return s.commitScan(ctx, grace, epoch, old, ordered, found)
+}
+
+func (s *store) commitScan(ctx context.Context, grace time.Duration, epoch int64, old, ordered []nodeRecord, found map[string]nodeRecord) error {
+	byPath := map[string]nodeRecord{}
+	for _, n := range old {
+		byPath[n.Path] = n
+	}
+	// Enumeration holds no tree lock. Reject a stale observation if any
+	// journal or metadata mutation occurred, then briefly exclude publication.
+	release, err := s.acquire(ctx, []resourceLock{{"node/" + s.spaceID, true}})
+	if err != nil {
+		return err
+	}
+	defer release()
+	var current int64
+	if err = s.reader().QueryRowContext(ctx, "SELECT value FROM settings WHERE key='epoch'").Scan(&current); err != nil {
+		return err
+	}
+	if current != epoch {
+		return nil
+	}
+	ops, err := s.pending(ctx)
+	if err != nil {
+		return err
+	}
+	if len(ops) > 0 {
+		return nil
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	changed := false
+	changed := []string{}
 	for _, n := range ordered {
 		prev, ok := byPath[n.Path]
 		if !ok || prev.ETag != n.ETag || prev.Missing != 0 {
-			changed = true
+			changed = append(changed, n.Path)
 			if ok && prev.ID != n.ID {
 				if _, err = tx.ExecContext(ctx, "DELETE FROM nodes WHERE id=?", prev.ID); err != nil {
 					return err
@@ -435,7 +514,7 @@ func (s *store) scan(ctx context.Context, grace time.Duration) error {
 		if _, ok := found[n.Path]; ok {
 			continue
 		}
-		changed = true
+		changed = append(changed, n.Path)
 		if n.Missing == 0 {
 			_, err = tx.ExecContext(ctx, "UPDATE nodes SET missing=? WHERE id=?", now, n.ID)
 		} else if time.Duration(now-n.Missing) >= grace {
@@ -448,22 +527,40 @@ func (s *store) scan(ctx context.Context, grace time.Duration) error {
 			return err
 		}
 	}
-	if changed {
-		if err = refreshDirectories(tx); err != nil {
+	if len(changed) > 0 {
+		if err = refreshDirectories(tx, changed...); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-// Directory ETags change conservatively on any committed tree change. This
-// intentionally favors correctness over minimal sync invalidation in v1.
-func refreshDirectories(tx *sql.Tx) error {
-	_, err := tx.Exec("UPDATE nodes SET etag=? WHERE dir=1", uuid.NewString())
-	return err
+// Invalidate only the changed paths and their ancestors. Unrelated directory
+// ETags stay stable; SQLite serializes these short metadata transactions.
+func refreshDirectories(tx *sql.Tx, paths ...string) error {
+	seen := map[string]bool{}
+	for _, p := range paths {
+		if p == "" || p == control || strings.HasPrefix(p, control+"/") {
+			continue
+		}
+		for {
+			if !seen[p] {
+				if _, err := tx.Exec("UPDATE nodes SET etag=? WHERE dir=1 AND path=?", uuid.NewString(), p); err != nil {
+					return err
+				}
+				seen[p] = true
+			}
+			if p == "." {
+				break
+			}
+			p = path.Dir(p)
+		}
+	}
+	return nil
 }
 
 type operation struct {
+	Locks                                      []resourceLock
 	ID, Kind, Source, Target, Digest, Previous string
 	Session                                    string
 	Node                                       nodeRecord
@@ -546,6 +643,10 @@ func (s *store) apply(ctx context.Context, op operation) error {
 	if err = s.syncDirs(path.Dir(op.Source)); err != nil {
 		return err
 	}
+	op.Locks, err = s.operationLocks(op)
+	if err != nil {
+		return err
+	}
 	op.Time = time.Now().UnixNano()
 	body, err := json.Marshal(op)
 	if err != nil {
@@ -619,6 +720,13 @@ func (s *store) finish(ctx context.Context, op operation) error {
 	if err = s.syncDirs(path.Dir(op.Source), path.Dir(op.Target), path.Join(control, "versions")); err != nil {
 		return err
 	}
+	var fi os.FileInfo
+	if op.Kind == "replace" || op.Kind == "create" {
+		fi, err = s.root.Stat(op.Target)
+		if err != nil {
+			return err
+		}
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -626,12 +734,16 @@ func (s *store) finish(ctx context.Context, op operation) error {
 	defer tx.Rollback()
 	switch op.Kind {
 	case "replace":
-		fi, e := s.root.Stat(op.Target)
+		result, e := tx.Exec("UPDATE nodes SET size=?,mtime=?,etag=?,missing=0 WHERE id=? AND etag=?", fi.Size(), fi.ModTime().UnixNano(), uuid.NewString(), op.Node.ID, op.Node.ETag)
 		if e != nil {
 			return e
 		}
-		if _, err = tx.Exec("UPDATE nodes SET size=?,mtime=?,etag=?,missing=0 WHERE id=?", fi.Size(), fi.ModTime().UnixNano(), uuid.NewString(), op.Node.ID); err != nil {
-			return err
+		changed, e := result.RowsAffected()
+		if e != nil {
+			return e
+		}
+		if changed != 1 {
+			return errors.New("pending replacement metadata revision changed")
 		}
 		body, e := json.Marshal(op.Node)
 		if e != nil {
@@ -664,10 +776,6 @@ func (s *store) finish(ctx context.Context, op operation) error {
 				return err
 			}
 		} else {
-			fi, e := s.root.Stat(op.Target)
-			if e != nil {
-				return e
-			}
 			n := op.Node
 			if _, err = tx.Exec("INSERT INTO nodes VALUES (?,?,?,?,?,?,?,?,0)", n.ID, n.Parent, n.Name, op.Target, n.Dir, fi.Size(), fi.ModTime().UnixNano(), uuid.NewString()); err != nil {
 				return err
@@ -689,7 +797,7 @@ func (s *store) finish(ctx context.Context, op operation) error {
 	default:
 		return fmt.Errorf("unknown operation kind %q", op.Kind)
 	}
-	if err = refreshDirectories(tx); err != nil {
+	if err = refreshDirectories(tx, op.Source, op.Target); err != nil {
 		return err
 	}
 	if op.Session != "" {
@@ -720,6 +828,9 @@ func (s *store) finish(ctx context.Context, op operation) error {
 	if _, err = tx.Exec("INSERT INTO outbox(node,kind) VALUES (?,?)", op.Node.ID, kind); err != nil {
 		return err
 	}
+	if _, err = tx.Exec("INSERT OR REPLACE INTO completed_operations VALUES (?,?,?,?)", op.ID, op.Kind, op.Node.ID, op.Time); err != nil {
+		return err
+	}
 	if _, err = tx.Exec("DELETE FROM operations WHERE id=?", op.ID); err != nil {
 		return err
 	}
@@ -727,43 +838,29 @@ func (s *store) finish(ctx context.Context, op operation) error {
 }
 
 func (s *store) recover(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, "SELECT body FROM operations ORDER BY rowid")
+	ops, err := s.pending(ctx)
 	if err != nil {
 		return err
 	}
-	var ops []operation
-	for rows.Next() {
-		var b []byte
-		var op operation
-		if err = rows.Scan(&b); err != nil {
-			break
-		}
-		if err = json.Unmarshal(b, &op); err != nil {
-			break
-		}
-		ops = append(ops, op)
-	}
-	if err == nil {
-		err = rows.Err()
-	}
-	rows.Close()
-	if err != nil {
-		return err
-	}
+	var failures []error
 	for _, op := range ops {
-		if err = s.finish(ctx, op); err != nil {
-			return err
+		attempt, cancel := context.WithTimeout(ctx, time.Second)
+		if err = s.recoverOne(attempt, op); err != nil {
+			failures = append(failures, err)
 		}
+		cancel()
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 func (s *store) close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return nil
 	}
 	s.closed = true
-	return errors.Join(s.db.Close(), s.root.Close())
+	s.mu.Unlock()
+	s.active.Wait()
+	return errors.Join(s.readDB.Close(), s.db.Close(), s.root.Close())
 }

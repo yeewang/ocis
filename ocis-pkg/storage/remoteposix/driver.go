@@ -72,13 +72,7 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	d.cancel = cancel
-	u, err := s.lock()
-	if err != nil {
-		s.close()
-		return nil, err
-	}
 	err = s.scan(ctx, c.MissingGrace)
-	u()
 	if err != nil {
 		s.close()
 		cancel()
@@ -96,18 +90,9 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 			case <-ctx.Done():
 				return
 			case <-tick.C:
-				u, e := s.lock()
-				if e != nil {
-					return
-				}
-				e = s.recover(ctx)
-				if e == nil {
-					e = s.scan(ctx, c.MissingGrace)
-				}
-				if e == nil {
-					e = d.publish(ctx)
-				}
-				u()
+				// A damaged operation must not prevent independent recovery,
+				// reconciliation attempts or delivery of already committed events.
+				e := errors.Join(s.recover(ctx), s.scan(ctx, c.MissingGrace), d.publish(ctx))
 				if e != nil {
 					d.log.Error().Err(e).Msg("remote filesystem reconciliation suspended")
 				}
@@ -129,22 +114,9 @@ func (d *Driver) Capabilities(context.Context) storage.Capabilities {
 }
 func (d *Driver) Shutdown(context.Context) error { d.cancel(); <-d.done; return d.s.close() }
 
+// Whole-tree maintenance remains exclusive. Ordinary requests name resources.
 func (d *Driver) begin(ctx context.Context) (func(), error) {
-	u, e := d.s.lock()
-	if e != nil {
-		return nil, e
-	}
-	if e = ctx.Err(); e == nil {
-		e = d.s.healthy()
-	}
-	if e == nil {
-		e = d.s.recover(ctx)
-	}
-	if e != nil {
-		u()
-		return nil, e
-	}
-	return u, nil
+	return d.beginRefs(ctx, lockRef{d.ref(d.s.spaceID), true})
 }
 
 func public(n nodeRecord) bool {
@@ -278,15 +250,15 @@ func (d *Driver) info(ctx context.Context, n nodeRecord) (*provider.ResourceInfo
 func (d *Driver) used(p string) uint64 {
 	var size int64
 	if p == "." {
-		_ = d.s.db.QueryRow("SELECT coalesce(sum(size),0) FROM nodes WHERE dir=0 AND missing=0 AND substr(path,1,?)!=?", len(control)+1, control+"/").Scan(&size)
+		_ = d.s.reader().QueryRow("SELECT coalesce(sum(size),0) FROM nodes WHERE dir=0 AND missing=0 AND substr(path,1,?)!=?", len(control)+1, control+"/").Scan(&size)
 	} else {
-		_ = d.s.db.QueryRow("SELECT coalesce(sum(size),0) FROM nodes WHERE dir=0 AND missing=0 AND (path=? OR substr(path,1,?)=?)", p, utf8.RuneCountInString(p)+1, p+"/").Scan(&size)
+		_ = d.s.reader().QueryRow("SELECT coalesce(sum(size),0) FROM nodes WHERE dir=0 AND missing=0 AND (path=? OR substr(path,1,?)=?)", p, utf8.RuneCountInString(p)+1, p+"/").Scan(&size)
 	}
 	return uint64(max(size, 0))
 }
 
 func (d *Driver) GetMD(ctx context.Context, ref *provider.Reference, _, _ []string) (*provider.ResourceInfo, error) {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{ref, false})
 	if e != nil {
 		return nil, e
 	}
@@ -301,7 +273,7 @@ func (d *Driver) GetMD(ctx context.Context, ref *provider.Reference, _, _ []stri
 	return d.info(ctx, n)
 }
 func (d *Driver) ListFolder(ctx context.Context, ref *provider.Reference, _, _ []string) ([]*provider.ResourceInfo, error) {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{ref, true})
 	if e != nil {
 		return nil, e
 	}
@@ -315,9 +287,6 @@ func (d *Driver) ListFolder(ctx context.Context, ref *provider.Reference, _, _ [
 	}
 	if !n.Dir {
 		return nil, errtypes.BadRequest("not a directory")
-	}
-	if e = d.s.scan(ctx, d.c.MissingGrace); e != nil {
-		return nil, e
 	}
 	all, e := d.s.records()
 	if e != nil {
@@ -342,7 +311,7 @@ func (d *Driver) ListFolder(ctx context.Context, ref *provider.Reference, _, _ [
 	return out, nil
 }
 func (d *Driver) Download(ctx context.Context, ref *provider.Reference, open func(*provider.ResourceInfo) bool) (*provider.ResourceInfo, io.ReadCloser, error) {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{ref, false})
 	if e != nil {
 		return nil, nil, e
 	}
@@ -378,7 +347,7 @@ func (d *Driver) GetPathByID(ctx context.Context, id *provider.ResourceId) (stri
 	return ri.Path, nil
 }
 func (d *Driver) GetQuota(ctx context.Context, ref *provider.Reference) (uint64, uint64, uint64, error) {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{d.ref(d.s.spaceID), true})
 	if e != nil {
 		return 0, 0, 0, e
 	}
@@ -424,7 +393,7 @@ func (d *Driver) ListStorageSpaces(ctx context.Context, filters []*provider.List
 }
 
 func (d *Driver) CreateDir(ctx context.Context, ref *provider.Reference) (*storage.CreateDirResult, error) {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{ref, true})
 	if e != nil {
 		return nil, e
 	}
@@ -448,7 +417,7 @@ func (d *Driver) CreateDir(ctx context.Context, ref *provider.Reference) (*stora
 	return &storage.CreateDirResult{SpaceOwner: d.owner(), SpaceID: d.s.spaceID, ResourceID: d.id(n.ID)}, nil
 }
 func (d *Driver) Move(ctx context.Context, src, dst *provider.Reference) (*storage.MoveResult, error) {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{src, true}, lockRef{dst, true})
 	if e != nil {
 		return nil, e
 	}
@@ -485,7 +454,7 @@ func (d *Driver) Move(ctx context.Context, src, dst *provider.Reference) (*stora
 	return &storage.MoveResult{SpaceOwner: d.owner(), OldReference: src, NewReference: dst}, nil
 }
 func (d *Driver) Delete(ctx context.Context, ref *provider.Reference) (*storage.DeleteResult, error) {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{ref, true})
 	if e != nil {
 		return nil, e
 	}
@@ -519,10 +488,15 @@ func (d *Driver) Delete(ctx context.Context, ref *provider.Reference) (*storage.
 }
 
 func (d *Driver) publish(ctx context.Context) error {
+	release, err := d.s.acquire(ctx, []resourceLock{{"outbox", true}})
+	if err != nil {
+		return err
+	}
+	defer release()
 	if d.stream == nil {
 		return nil
 	}
-	rows, e := d.s.db.Query("SELECT id,node,kind FROM outbox ORDER BY id LIMIT 100")
+	rows, e := d.s.reader().Query("SELECT id,node,kind FROM outbox ORDER BY id LIMIT 100")
 	if e != nil {
 		return e
 	}

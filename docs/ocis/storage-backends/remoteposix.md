@@ -71,10 +71,10 @@ who can directly access the remote mount.
 - Renames between the root and its reserved control directory must be supported;
   do not place nested mounts in the exported tree.
 - Persistent **local** state directory outside the remote root. Keep the SQLite
-  database, WAL, shared-memory file, operation lock and staging files together.
+  database, WAL, shared-memory file, lock directory and staging files together.
   Do not put this directory on NFS, SMB or another network mount.
 - All instances serving this root must run on one host and use the same state
-  directory. Provider instances serialize operations through a local file lock.
+  directory. Provider instances coordinate through local POSIX advisory locks.
   Independent databases on multiple hosts are unsupported.
 - Direct filesystem editors are trusted. Schedule their writes separately from
   oCIS mutations: ordinary POSIX rename cannot provide a distributed transaction
@@ -102,18 +102,74 @@ exported tree are rejected; a scan encountering one stops without committing.
   A mismatch or ambiguous source/destination stops recovery and preserves the
   journal for investigation. It does not guess which resource should be deleted.
 - An outbox retains file-change notifications until publication succeeds. Delivery
-  is at least once. Directory ETags currently invalidate conservatively on any
-  committed tree change. This implementation prioritizes correctness over large
-  tree throughput; scans and file operations serialize per root.
+  is at least once. Only changed directories and their ancestors receive new
+  ETags. Unrelated directories retain their ETags.
 - Polling imports external additions and size/mtime changes. Directory listing
-  also triggers reconciliation. Failed walks or failed mount-identity checks do
-  not commit scan results. Missing paths are hidden while their metadata is held
-  through the grace period. A scan losing more than ten entries and more than 25%
+  reads committed metadata; it does not trigger a remote-tree walk. Failed walks
+  or failed mount-identity checks do not commit scan results. Missing paths are
+  hidden while their metadata is held through the grace period. A scan losing
+  more than ten entries and more than 25%
   of known entries stops for administrator investigation.
 - External renames are delete-plus-create and receive new IDs. A file observed
   missing and subsequently recreated also receives a new ID. Content edits that
   preserve both size and mtime are not detected by polling. Content-hash polling
   and an external-rename identity service are not implemented.
+
+## Concurrency and commit protocol
+
+- File reads take shared UUID and directory-entry locks. Writes take exclusive
+  locks on their file and entry, with shared locks on ancestors. Directory moves,
+  deletion and grant changes exclude conflicting descendant requests. Every
+  resource lock set is sorted, merged and acquired without lock upgrades; paths
+  and parent IDs are revalidated after acquisition. Lock waits respect request
+  cancellation and are capped at 30 seconds.
+- Multiple provider processes on the same host can transfer different files
+  concurrently. A TUS chunk holds only its session lock. Upload completion copies
+  and syncs a temporary remote file before acquiring destination locks, then
+  rechecks the parent ID, permissions and expected file ETag. Competing writers
+  against the same ETag produce one winner and a precondition failure.
+- Downloads open the file and obtain matching metadata under shared locks, then
+  release locks before streaming. Already open downloads continue reading the
+  old retained file when a replacement is published. Upload-stage readers see
+  only the durable offset captured when opened.
+- SQLite has a query-only reader pool and a separate writer connection using
+  immediate transactions. WAL permits metadata readers during a write transaction;
+  SQLite still serializes writers. Remote copying, hashing, renaming and syncing
+  happen outside runtime database transactions.
+- Publication commits a durable intent with a resource-lock manifest, performs
+  and syncs the remote rename, then atomically commits file metadata, retained
+  versions, the upload result, a completion receipt and outbox events while
+  deleting the intent. The request succeeds only after that final commit.
+  **This is a recovery protocol, not a transaction spanning SQLite and POSIX.**
+- Requests check overlapping pending intents while holding resource locks. Before
+  recovery they release those locks, acquire the session (if applicable), an
+  operation claim and the sorted resource locks, then recheck the journal. Live
+  publishers own the same resources, so recovery cannot interfere with them.
+  Process exit releases kernel locks. Completed TUS and simple-upload retries
+  return their existing session result rather than publishing another version.
+- A pending or ambiguous operation blocks its affected resources and ancestor
+  directory views. Independent file operations remain available, including after
+  restart. Recovery attempts other operations even if one fails. Polling waits
+  until pending operations are resolved before reconciling external changes.
+- Scan enumeration takes no tree lock. A database mutation epoch rejects stale
+  observations; only the scan's final metadata commit takes the root lock. A busy
+  tree can delay external-change import until a later polling pass. Directory
+  metadata/listing requests briefly exclude writes within their subtree to give
+  consistent aggregate metadata. Root-wide queries and emptying the entire trash
+  remain root-wide operations; individual trash restore/purge locks its item.
+
+Lock files are permanent identifiers. Do not unlink the `locks` directory while
+any provider is running. Completion receipts and lock files have no automatic
+retention policy in this experimental version.
+
+## Upgrade
+
+Stop **all** providers using this root before upgrading from the initial
+single-lock implementation. Back up the local state and remote tree together.
+The driver upgrades local metadata to schema 2 and can recover older journal
+records without lock manifests. Do not run the old and new binaries together:
+they use different runtime lock protocols. The old binary rejects schema 2 on
+startup; reverting requires restoring the matching backup.
 
 After a recovery error, stop the provider, preserve the local state and remote
 tree, and inspect the `operations` table together with the recorded source,

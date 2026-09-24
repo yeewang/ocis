@@ -22,11 +22,11 @@ type retained struct {
 }
 
 func (d *Driver) retained(key string) (r retained, e error) {
-	e = d.s.db.QueryRow("SELECT id,node,path,kind,size,time,snapshot FROM retained WHERE id=?", key).Scan(&r.ID, &r.Node, &r.Path, &r.Kind, &r.Size, &r.Time, &r.Snapshot)
+	e = d.s.reader().QueryRow("SELECT id,node,path,kind,size,time,snapshot FROM retained WHERE id=?", key).Scan(&r.ID, &r.Node, &r.Path, &r.Kind, &r.Size, &r.Time, &r.Snapshot)
 	return r, mapError(e)
 }
 func (d *Driver) retention(kind, node string) ([]retained, error) {
-	rows, e := d.s.db.Query("SELECT id,node,path,kind,size,time,snapshot FROM retained WHERE kind=? AND (?='' OR node=?) ORDER BY time DESC", kind, node, node)
+	rows, e := d.s.reader().Query("SELECT id,node,path,kind,size,time,snapshot FROM retained WHERE kind=? AND (?='' OR node=?) ORDER BY time DESC", kind, node, node)
 	if e != nil {
 		return nil, e
 	}
@@ -43,7 +43,7 @@ func (d *Driver) retention(kind, node string) ([]retained, error) {
 }
 
 func (d *Driver) ListRevisions(ctx context.Context, ref *provider.Reference) ([]*provider.FileVersion, error) {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{ref, false})
 	if e != nil {
 		return nil, e
 	}
@@ -66,7 +66,7 @@ func (d *Driver) ListRevisions(ctx context.Context, ref *provider.Reference) ([]
 	return out, nil
 }
 func (d *Driver) DownloadRevision(ctx context.Context, ref *provider.Reference, key string, open func(*provider.ResourceInfo) bool) (*provider.ResourceInfo, io.ReadCloser, error) {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{ref, false})
 	if e != nil {
 		return nil, nil, e
 	}
@@ -102,7 +102,7 @@ func (d *Driver) DownloadRevision(ctx context.Context, ref *provider.Reference, 
 	return ri, f, e
 }
 func (d *Driver) RestoreRevision(ctx context.Context, ref *provider.Reference, key string) (*storage.RestoreRevisionResult, error) {
-	u, e := d.begin(ctx)
+	u, e := d.beginRefs(ctx, lockRef{ref, true})
 	if e != nil {
 		return nil, e
 	}
@@ -184,8 +184,42 @@ func (d *Driver) ListRecycle(ctx context.Context, ref *provider.Reference, key, 
 	}
 	return out, nil
 }
+
+// Lock retained content by stable ID; an old parent may already be purged.
+func (d *Driver) beginTrash(ctx context.Context, key string, dst *provider.Reference, restore bool) (func(), retained, *provider.Reference, error) {
+	leave, err := d.s.enter()
+	if err != nil {
+		return nil, retained{}, dst, err
+	}
+	r, err := d.retained(key)
+	if err != nil {
+		leave()
+		return nil, r, dst, err
+	}
+	refs := []lockRef{{d.ref(r.Node), true}}
+	if restore {
+		if dst == nil {
+			dst = &provider.Reference{ResourceId: d.id(d.s.spaceID), Path: r.Path}
+		}
+		refs = append(refs, lockRef{dst, true})
+	}
+	release, err := d.beginRefs(ctx, refs...)
+	if err != nil {
+		leave()
+		return nil, r, dst, err
+	}
+	r, err = d.retained(key)
+	if err != nil {
+		release()
+		leave()
+		return nil, r, dst, err
+	}
+	return func() { release(); leave() }, r, dst, nil
+}
+
 func (d *Driver) RestoreRecycleItem(ctx context.Context, ref *provider.Reference, key, relative string, dst *provider.Reference) (*storage.RestoreRecycleItemResult, error) {
-	u, e := d.begin(ctx)
+	u, r, destination, e := d.beginTrash(ctx, key, dst, true)
+	dst = destination
 	if e != nil {
 		return nil, e
 	}
@@ -196,15 +230,8 @@ func (d *Driver) RestoreRecycleItem(ctx context.Context, ref *provider.Reference
 	if relative != "" {
 		return nil, errtypes.NotSupported("restore a complete trash item")
 	}
-	r, e := d.retained(key)
-	if e != nil {
-		return nil, e
-	}
 	if r.Kind != "trash" {
 		return nil, errtypes.NotFound(key)
-	}
-	if dst == nil {
-		dst = &provider.Reference{ResourceId: d.id(d.s.spaceID), Path: r.Path}
 	}
 	parent, p, e := d.target(dst)
 	if e != nil {
@@ -281,7 +308,7 @@ func (d *Driver) purge(ctx context.Context, key string) error {
 	return tx.Commit()
 }
 func (d *Driver) PurgeRecycleItem(ctx context.Context, ref *provider.Reference, key, relative string) error {
-	u, e := d.begin(ctx)
+	u, _, _, e := d.beginTrash(ctx, key, nil, false)
 	if e != nil {
 		return e
 	}
