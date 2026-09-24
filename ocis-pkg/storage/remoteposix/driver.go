@@ -78,27 +78,7 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 		cancel()
 		return nil, err
 	}
-	go func() {
-		defer close(d.done)
-		if !c.Watch {
-			return
-		}
-		tick := time.NewTicker(c.ScanInterval)
-		defer tick.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-tick.C:
-				// A damaged operation must not prevent independent recovery,
-				// reconciliation attempts or delivery of already committed events.
-				e := errors.Join(s.recover(ctx), s.scan(ctx, c.MissingGrace), d.publish(ctx))
-				if e != nil {
-					d.log.Error().Err(e).Msg("remote filesystem reconciliation suspended")
-				}
-			}
-		}
-	}()
+	go d.maintain(ctx)
 	return d, nil
 }
 

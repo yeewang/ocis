@@ -29,16 +29,6 @@ type lockRef struct {
 }
 type heldSessionKey struct{}
 
-func (s *store) enter() (func(), error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil, errors.New("remoteposix: store closed")
-	}
-	s.active.Add(1)
-	return s.active.Done, nil
-}
-
 func normalizeLocks(in []resourceLock) []resourceLock {
 	m := map[string]bool{}
 	for _, l := range in {

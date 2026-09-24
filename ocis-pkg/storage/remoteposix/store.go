@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -34,6 +35,9 @@ type nodeRecord struct {
 }
 
 type store struct {
+	rootMu                   sync.RWMutex
+	generation               int64
+	offline                  atomic.Bool
 	db                       *sql.DB
 	readDB                   *sql.DB
 	root                     *os.Root
@@ -82,6 +86,11 @@ func openStore(rootPath, state string) (_ *store, err error) {
 		return nil, err
 	}
 	defer unlock()
+	gate, err := mountGate(state, false)
+	if err != nil {
+		return nil, err
+	}
+	defer gate()
 	s.root, err = os.OpenRoot(rootPath)
 	if err != nil {
 		return nil, err
@@ -114,6 +123,7 @@ CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, node TE
 CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, body BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS completed_operations (id TEXT NOT NULL, kind TEXT NOT NULL, node TEXT NOT NULL, time INTEGER NOT NULL, PRIMARY KEY(id,kind));
 INSERT OR IGNORE INTO settings VALUES ('epoch','0');
+INSERT OR IGNORE INTO settings VALUES ('mount_generation','0');
 CREATE TRIGGER IF NOT EXISTS nodes_insert_epoch AFTER INSERT ON nodes BEGIN UPDATE settings SET value=CAST(value AS INTEGER)+1 WHERE key='epoch'; END;
 CREATE TRIGGER IF NOT EXISTS nodes_update_epoch AFTER UPDATE ON nodes BEGIN UPDATE settings SET value=CAST(value AS INTEGER)+1 WHERE key='epoch'; END;
 CREATE TRIGGER IF NOT EXISTS nodes_delete_epoch AFTER DELETE ON nodes BEGIN UPDATE settings SET value=CAST(value AS INTEGER)+1 WHERE key='epoch'; END;
@@ -177,7 +187,7 @@ CREATE TRIGGER IF NOT EXISTS operations_delete_epoch AFTER DELETE ON operations 
 	} else if err != nil {
 		return nil, err
 	} else {
-		if version != "1" && version != "2" {
+		if version != "1" && version != "2" && version != "3" {
 			return nil, fmt.Errorf("unsupported metadata schema %q", version)
 		}
 		if err = s.reader().QueryRow("SELECT value FROM settings WHERE key='space'").Scan(&s.spaceID); err != nil {
@@ -194,7 +204,7 @@ CREATE TRIGGER IF NOT EXISTS operations_delete_epoch AFTER DELETE ON operations 
 	if err = s.healthy(); err != nil {
 		return nil, err
 	}
-	if _, err = s.db.Exec("UPDATE settings SET value='2' WHERE key='schema'"); err != nil {
+	if _, err = s.db.Exec("UPDATE settings SET value='3' WHERE key='schema'"); err != nil {
 		return nil, err
 	}
 	// Readers use deferred, query-only transactions; the writer connection
@@ -205,6 +215,9 @@ CREATE TRIGGER IF NOT EXISTS operations_delete_epoch AFTER DELETE ON operations 
 	}
 	s.readDB.SetMaxOpenConns(8)
 	if err = s.readDB.Ping(); err != nil {
+		return nil, err
+	}
+	if err = s.reader().QueryRow("SELECT value FROM settings WHERE key='mount_generation'").Scan(&s.generation); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -726,6 +739,11 @@ func (s *store) finish(ctx context.Context, op operation) error {
 		if err != nil {
 			return err
 		}
+	}
+	// If the mount changed during publication, keep the durable intent for
+	// recovery rather than committing metadata for a detached root handle.
+	if err = s.healthy(); err != nil {
+		return err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

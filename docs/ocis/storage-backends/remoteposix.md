@@ -71,7 +71,7 @@ who can directly access the remote mount.
 - Renames between the root and its reserved control directory must be supported;
   do not place nested mounts in the exported tree.
 - Persistent **local** state directory outside the remote root. Keep the SQLite
-  database, WAL, shared-memory file, lock directory and staging files together.
+  database, WAL, shared-memory file, lock directory, `mount.lock` and staging files together.
   Do not put this directory on NFS, SMB or another network mount.
 - All instances serving this root must run on one host and use the same state
   directory. Provider instances coordinate through local POSIX advisory locks.
@@ -162,13 +162,46 @@ Lock files are permanent identifiers. Do not unlink the `locks` directory while
 any provider is running. Completion receipts and lock files have no automatic
 retention policy in this experimental version.
 
+## Disconnect and automatic reconnect
+
+Every provider runs a reconnect monitor, including data providers with polling
+(`watch`) disabled. Healthy probes run once per second. Failed reconnect or
+recovery attempts back off to at most 30 seconds. The operating system remains
+responsible for mounting the remote filesystem; the driver does not run mount
+commands or create a replacement empty root.
+
+A detected mount failure rejects new requests and preserves local staging,
+metadata and durable operation intents. Once the configured path is accessible,
+the monitor validates the original space identity and existing control directories.
+Missing or foreign identities are rejected without creating any remote state.
+
+Every operation holds a shared `mount.lock` lease before taking resource locks.
+Reopening takes an exclusive lease across all provider processes, so active
+operations must finish first. A persisted mount generation forces every instance
+to reopen its own root handle before accepting more work. Pending publication
+intents are recovered automatically, with continued retries when recovery remains
+incomplete. An ambiguous intent still blocks its affected resources; independent
+resources remain usable. Polling resumes once pending intents are resolved.
+
+Existing upload sessions can be retried after reconnect. Already open download
+streams retain their file descriptor; they may continue or return an I/O error
+and are not transparently restarted. Initial provider startup still requires an
+accessible, valid mount.
+
+Filesystem calls themselves are synchronous and cannot be bounded by the lock
+or context timeout. A kernel-blocked filesystem call retains its mount/resource
+leases and can delay reconnect and shutdown. The monitor deliberately does not
+release those leases or launch replacement writers while that call may complete.
+Reconnect tests simulate handle invalidation with replacement local directories;
+real NFS/SMB/FUSE disconnection and server recovery still require deployment tests.
+
 ## Upgrade
 
-Stop **all** providers using this root before upgrading from the initial
-single-lock implementation. Back up the local state and remote tree together.
-The driver upgrades local metadata to schema 2 and can recover older journal
+Stop **all** providers using this root before upgrading from an earlier
+implementation (including schema 2). Back up the local state and remote tree together.
+The driver upgrades local metadata to schema 3 and can recover older journal
 records without lock manifests. Do not run the old and new binaries together:
-they use different runtime lock protocols. The old binary rejects schema 2 on
+they use different runtime lock protocols. The older binaries reject schema 3 on
 startup; reverting requires restoring the matching backup.
 
 After a recovery error, stop the provider, preserve the local state and remote

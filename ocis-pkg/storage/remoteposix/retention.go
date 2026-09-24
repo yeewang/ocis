@@ -289,6 +289,9 @@ func (d *Driver) purge(ctx context.Context, key string) error {
 	if e = d.s.syncDirs(path.Join(control, "trash"), path.Join(control, "versions")); e != nil {
 		return e
 	}
+	if e = d.s.healthy(); e != nil {
+		return e
+	}
 	tx, e := d.s.db.BeginTx(ctx, nil)
 	if e != nil {
 		return e
