@@ -24,7 +24,7 @@ type Config struct {
 	SkipUserGroupsInToken   bool `yaml:"skip_user_groups_in_token" env:"STORAGE_USERS_SKIP_USER_GROUPS_IN_TOKEN" desc:"Disables the loading of user's group memberships from the reva access token." introductionVersion:"pre5.0"`
 	GracefulShutdownTimeout int  `yaml:"graceful_shutdown_timeout" env:"STORAGE_USERS_GRACEFUL_SHUTDOWN_TIMEOUT" desc:"The number of seconds to wait for the 'storage-users' service to shutdown cleanly before exiting with an error that gets logged. Note: This setting is only applicable when running the 'storage-users' service as a standalone service. See the text description for more details." introductionVersion:"pre5.0"`
 
-	Driver         string  `yaml:"driver" env:"STORAGE_USERS_DRIVER" desc:"The storage driver which should be used by the service. Defaults to 'ocis', Supported values are: 'ocis', 's3ng' and 'owncloudsql' (deprecated). The 'ocis' driver stores all data (blob and meta data) in an POSIX compliant volume. The 's3ng' driver stores metadata in a POSIX compliant volume and uploads blobs to the s3 bucket." introductionVersion:"pre5.0"`
+	Driver         string  `yaml:"driver" env:"STORAGE_USERS_DRIVER" desc:"The storage driver which should be used by the service. Defaults to 'ocis', Supported values are: 'ocis', 's3ng', 'posix', 'remoteposix' (experimental), and 'owncloudsql' (deprecated). The 'ocis' driver stores all data (blob and meta data) in an POSIX compliant volume. The 's3ng' driver stores metadata in a POSIX compliant volume and uploads blobs to the s3 bucket." introductionVersion:"pre5.0"`
 	Drivers        Drivers `yaml:"drivers"`
 	DataServerURL  string  `yaml:"data_server_url" env:"STORAGE_USERS_DATA_SERVER_URL" desc:"URL of the data server, needs to be reachable by the data gateway provided by the frontend service or the user if directly exposed." introductionVersion:"pre5.0"`
 	DataGatewayURL string  `yaml:"data_gateway_url" env:"STORAGE_USERS_DATA_GATEWAY_URL" desc:"URL of the data gateway server" introductionVersion:"pre5.0"`
@@ -100,6 +100,7 @@ type CORS struct {
 
 // Drivers combine all storage driver configurations
 type Drivers struct {
+	RemotePosix RemotePosixDriver `yaml:"remoteposix"`
 	OCIS        OCISDriver        `yaml:"ocis"`
 	S3NG        S3NGDriver        `yaml:"s3ng"`
 	OwnCloudSQL OwnCloudSQLDriver `yaml:"owncloudsql"`
@@ -108,6 +109,17 @@ type Drivers struct {
 	S3    S3Driver    `yaml:",omitempty"` // not supported by the oCIS product, therefore not part of docs
 	EOS   EOSDriver   `yaml:",omitempty"` // not supported by the oCIS product, therefore not part of docs
 	Local LocalDriver `yaml:",omitempty"` // not supported by the oCIS product, therefore not part of docs
+}
+
+// RemotePosixDriver exposes a mounted directory tree with local SQLite metadata.
+type RemotePosixDriver struct {
+	Root         string        `yaml:"root" env:"STORAGE_USERS_REMOTEPOSIX_ROOT" desc:"Existing mounted directory to expose as a project space." introductionVersion:"8.1.0"`
+	StateDir     string        `yaml:"state_dir" env:"STORAGE_USERS_REMOTEPOSIX_STATE_DIR" desc:"Absolute local persistent directory for SQLite metadata. Must be outside the remote root and shared by the metadata and data providers on the same host." introductionVersion:"8.1.0"`
+	OwnerID      string        `yaml:"owner_id" env:"STORAGE_USERS_REMOTEPOSIX_OWNER_ID" desc:"Opaque user ID of the project space owner." introductionVersion:"8.1.0"`
+	OwnerIDP     string        `yaml:"owner_idp" env:"STORAGE_USERS_REMOTEPOSIX_OWNER_IDP" desc:"Identity provider of the project space owner." introductionVersion:"8.1.0"`
+	SpaceName    string        `yaml:"space_name" env:"STORAGE_USERS_REMOTEPOSIX_SPACE_NAME" desc:"Display name of the configured project space." introductionVersion:"8.1.0"`
+	ScanInterval time.Duration `yaml:"scan_interval" env:"STORAGE_USERS_REMOTEPOSIX_SCAN_INTERVAL" desc:"Interval between remote directory scans. Defaults to one minute." introductionVersion:"8.1.0"`
+	MissingGrace time.Duration `yaml:"missing_grace_period" env:"STORAGE_USERS_REMOTEPOSIX_MISSING_GRACE_PERIOD" desc:"Minimum duration to retain metadata for externally removed files. Defaults to ten minutes." introductionVersion:"8.1.0"`
 }
 
 // AsyncPropagatorOptions configures the async propagator
