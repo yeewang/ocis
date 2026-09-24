@@ -202,6 +202,21 @@ func (m *manager) Handler(fs storage.FS) (http.Handler, error) {
 		}
 	}))
 
+	// Some datastores require an identity on every chunk. Let them validate the
+	// gateway's session-scoped transfer capability before any datastore access.
+	if authorizer, ok := fs.(interface {
+		AuthorizeUploadRequest(*http.Request) (*http.Request, error)
+	}); ok {
+		next := h
+		h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authorized, err := authorizer.AuthorizeUploadRequest(r)
+			if err != nil {
+				http.Error(w, "upload transfer forbidden", http.StatusForbidden)
+				return
+			}
+			next.ServeHTTP(w, authorized)
+		})
+	}
 	return h, nil
 }
 

@@ -178,6 +178,9 @@ func DefaultConfig() *config.Config {
 
 // EnsureDefaults adds default values to the configuration if they are not set yet
 func EnsureDefaults(cfg *config.Config) {
+	if cfg.TransferSecret == "" && cfg.Commons != nil {
+		cfg.TransferSecret = cfg.Commons.TransferSecret
+	}
 	// provide with defaults for shared logging, since we need a valid destination address for "envdecode".
 	if cfg.Log == nil && cfg.Commons != nil && cfg.Commons.Log != nil {
 		cfg.Log = &config.Log{

@@ -26,6 +26,7 @@ type session struct {
 	Info                                                      tusd.FileInfo
 	User, IDP, Parent, Name, ExpectedID, ExpectedETag, Result string
 	Created                                                   int64
+	Groups                                                    []string
 }
 type upload struct {
 	d  *Driver
@@ -33,6 +34,21 @@ type upload struct {
 }
 
 func (d *Driver) session(ctx context.Context, id string) (session, error) {
+	s, e := d.loadSession(id)
+	if e != nil {
+		return s, e
+	}
+	u, e := executant(ctx)
+	if e != nil {
+		return s, e
+	}
+	if u.Id.OpaqueId != s.User || u.Id.Idp != s.IDP {
+		return s, errtypes.PermissionDenied("upload owner")
+	}
+	return s, nil
+}
+
+func (d *Driver) loadSession(id string) (session, error) {
 	var s session
 	if _, e := uuid.Parse(id); e != nil {
 		return s, tusd.ErrNotFound
@@ -43,13 +59,6 @@ func (d *Driver) session(ctx context.Context, id string) (session, error) {
 	}
 	if e := json.Unmarshal(b, &s); e != nil {
 		return s, e
-	}
-	u, e := executant(ctx)
-	if e != nil {
-		return s, e
-	}
-	if u.Id.OpaqueId != s.User || u.Id.Idp != s.IDP {
-		return s, errtypes.PermissionDenied("upload owner")
 	}
 	if time.Since(time.Unix(0, s.Created)) > 24*time.Hour {
 		return s, errtypes.PreconditionFailed("upload expired")
@@ -65,6 +74,37 @@ func (d *Driver) saveSession(s session) error {
 	return e
 }
 func (d *Driver) stage(id string) string { return filepath.Join(d.s.state, "staging", id) }
+
+// parseUploadMtime accepts Unix seconds, including the fractional seconds sent
+// by Web from File.lastModified / 1000. Avoid floating-point precision loss.
+func parseUploadMtime(value string) (time.Time, error) {
+	seconds, fraction, fractional := strings.Cut(value, ".")
+	sec, err := strconv.ParseInt(seconds, 10, 64)
+	if err != nil {
+		return time.Time{}, errtypes.BadRequest("invalid mtime")
+	}
+	var nanos int64
+	if fractional {
+		if len(fraction) == 0 || len(fraction) > 9 {
+			return time.Time{}, errtypes.BadRequest("invalid mtime")
+		}
+		for _, digit := range fraction {
+			if digit < '0' || digit > '9' {
+				return time.Time{}, errtypes.BadRequest("invalid mtime")
+			}
+		}
+		nanos, _ = strconv.ParseInt(fraction+strings.Repeat("0", 9-len(fraction)), 10, 64)
+		if strings.HasPrefix(seconds, "-") {
+			nanos = -nanos
+		}
+	}
+	mtime := time.Unix(sec, nanos)
+	// Metadata stores nanoseconds in an int64; reject times outside that range.
+	if !time.Unix(0, mtime.UnixNano()).Equal(mtime) {
+		return time.Time{}, errtypes.BadRequest("mtime out of range")
+	}
+	return mtime, nil
+}
 
 func (d *Driver) start(ctx context.Context, ref *provider.Reference, info tusd.FileInfo) (tusd.Upload, error) {
 	u, e := d.beginRefs(ctx, lockRef{ref, true})
@@ -86,8 +126,8 @@ func (d *Driver) start(ctx context.Context, ref *provider.Reference, info tusd.F
 		return nil, errtypes.BadRequest("negative upload size")
 	}
 	if mtime := info.MetaData["mtime"]; mtime != "" {
-		if _, err := strconv.ParseInt(mtime, 10, 64); err != nil {
-			return nil, errtypes.BadRequest("invalid mtime")
+		if _, err := parseUploadMtime(mtime); err != nil {
+			return nil, err
 		}
 	}
 	metadata := tusd.MetaData{}
@@ -107,7 +147,7 @@ func (d *Driver) start(ctx context.Context, ref *provider.Reference, info tusd.F
 	}
 	info.MetaData["providerID"] = d.c.MountID
 	info.MetaData["expires"] = time.Now().Add(24 * time.Hour).Format(time.RFC3339)
-	s := session{Info: info, User: user.Id.OpaqueId, IDP: user.Id.Idp, Parent: parent.ID, Name: path.Base(p), Created: time.Now().UnixNano()}
+	s := session{Info: info, User: user.Id.OpaqueId, IDP: user.Id.Idp, Groups: append([]string(nil), user.Groups...), Parent: parent.ID, Name: path.Base(p), Created: time.Now().UnixNano()}
 	if n, e := d.s.byPath(p); e == nil {
 		if n.Dir {
 			return nil, errtypes.AlreadyExists(p)
@@ -321,11 +361,10 @@ func (d *Driver) prepare(ctx context.Context, r io.Reader, length int64, session
 			return "", err
 		}
 		if value := upload.Info.MetaData["mtime"]; value != "" {
-			seconds, err := strconv.ParseInt(value, 10, 64)
+			mtime, err := parseUploadMtime(value)
 			if err != nil {
 				return "", err
 			}
-			mtime := time.Unix(seconds, 0)
 			if err = d.s.root.Chtimes(tmp, mtime, mtime); err != nil {
 				return "", err
 			}

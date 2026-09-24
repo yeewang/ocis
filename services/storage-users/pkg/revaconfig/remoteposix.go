@@ -21,6 +21,7 @@ func RemotePosix(cfg *config.Config, watch bool) map[string]interface{} {
 		"root": c.Root, "state_dir": c.StateDir,
 		"owner_id": c.OwnerID, "owner_idp": c.OwnerIDP,
 		"space_name": c.SpaceName, "mount_id": cfg.MountID,
+		"transfer_secret": cfg.TransferSecret, "data_server_url": cfg.DataServerURL,
 		"scan_interval": c.ScanInterval, "missing_grace_period": c.MissingGrace,
 		"watch": watch,
 	}

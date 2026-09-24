@@ -29,15 +29,17 @@ import (
 func init() { registry.Register("remoteposix", New) }
 
 type Config struct {
-	Root         string        `mapstructure:"root"`
-	StateDir     string        `mapstructure:"state_dir"`
-	OwnerID      string        `mapstructure:"owner_id"`
-	OwnerIDP     string        `mapstructure:"owner_idp"`
-	SpaceName    string        `mapstructure:"space_name"`
-	MountID      string        `mapstructure:"mount_id"`
-	ScanInterval time.Duration `mapstructure:"scan_interval"`
-	MissingGrace time.Duration `mapstructure:"missing_grace_period"`
-	Watch        bool          `mapstructure:"watch"`
+	Root           string        `mapstructure:"root"`
+	StateDir       string        `mapstructure:"state_dir"`
+	OwnerID        string        `mapstructure:"owner_id"`
+	OwnerIDP       string        `mapstructure:"owner_idp"`
+	SpaceName      string        `mapstructure:"space_name"`
+	MountID        string        `mapstructure:"mount_id"`
+	TransferSecret string        `mapstructure:"transfer_secret"`
+	DataServerURL  string        `mapstructure:"data_server_url"`
+	ScanInterval   time.Duration `mapstructure:"scan_interval"`
+	MissingGrace   time.Duration `mapstructure:"missing_grace_period"`
+	Watch          bool          `mapstructure:"watch"`
 }
 
 type Driver struct {

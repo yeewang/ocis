@@ -60,6 +60,14 @@ mount. Grant UID/GID 1000 access to these paths before starting the container.
 Providers for the same root must share the same local state directory and mount
 namespace view of the remote root. The image does not mount NFS/SMB itself.
 
+The remote provider must share the gateway's `transfer_secret` (or
+`OCIS_TRANSFER_SECRET`), inherited from the common oCIS configuration. Browser
+TUS requests use a signed transfer URL rather than an internal user token. The
+provider validates its signature, audience, expiration and exact session target
+before restoring the upload owner's identity; knowing a session UUID alone does
+not authorize an upload. Keep `STORAGE_USERS_DATA_SERVER_URL` consistent with the
+URL advertised to the gateway.
+
 An exported Docker archive can be imported with:
 
 ```sh
