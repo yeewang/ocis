@@ -18,10 +18,11 @@ type Config struct {
 
 	HTTP HTTP `yaml:"http"`
 
-	Asset Asset  `yaml:"asset"`
-	File  string `yaml:"file" env:"WEB_UI_CONFIG_FILE" desc:"Read the ownCloud Web json based configuration from this path/file. The config file takes precedence over WEB_OPTION_xxx environment variables. See the text description for more details." introductionVersion:"pre5.0"`
-	Web   Web    `yaml:"web"`
-	Apps  map[string]App
+	Asset               Asset  `yaml:"asset"`
+	File                string `yaml:"file" env:"WEB_UI_CONFIG_FILE" desc:"Read the ownCloud Web json based configuration from this path/file. The config file takes precedence over WEB_OPTION_xxx environment variables. See the text description for more details." introductionVersion:"pre5.0"`
+	Web                 Web    `yaml:"web"`
+	Apps                map[string]App
+	AppInstallerEnabled bool `yaml:"app_installer_enabled" env:"WEB_APP_INSTALLER_ENABLED" desc:"Allow server administrators to install Web extensions from the official marketplace catalog." introductionVersion:"8.2.0"`
 
 	TokenManager *TokenManager `yaml:"token_manager"`
 

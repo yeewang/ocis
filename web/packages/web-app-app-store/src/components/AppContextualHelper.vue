@@ -3,7 +3,7 @@
     :title="$gettext('How to install?')"
     :text="
       $gettext(
-        'The App Store app lets you download apps as .zip files. Please follow the link below to learn how to install these apps into your oCIS.'
+        'Server administrators can click Install for apps from the official marketplace when installation is enabled. Reload the page after installation. Download remains available for manual installation.'
       )
     "
     read-more-link="https://owncloud.dev/services/web/#web-apps"

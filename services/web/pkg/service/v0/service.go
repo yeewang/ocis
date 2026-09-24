@@ -46,6 +46,7 @@ func NewService(opts ...Option) (Service, error) {
 		coreFS:          options.CoreFS,
 		themeFS:         options.ThemeFS,
 		gatewaySelector: options.GatewaySelector,
+		externalApps:    options.ExternalApps,
 	}
 
 	themeService, err := theme.NewService(
@@ -58,6 +59,11 @@ func NewService(opts ...Option) (Service, error) {
 	}
 
 	m.Route(options.Config.HTTP.Root, func(r chi.Router) {
+		if options.Config.AppInstallerEnabled {
+			installer := newAppInstaller(options)
+			r.With(installer.requireAdmin).Get("/api/app-store/installed", installer.list)
+			r.With(installer.requireAdmin).Post("/api/app-store/install", installer.install)
+		}
 		r.Get("/config.json", svc.Config)
 		r.Route("/branding/logo", func(r chi.Router) {
 			r.Use(middleware.ExtractAccountUUID(
@@ -102,6 +108,7 @@ type Web struct {
 	coreFS          fs.FS
 	themeFS         *fsx.FallbackFS
 	gatewaySelector pool.Selectable[gateway.GatewayAPIClient]
+	externalApps    func() []config.ExternalApp
 }
 
 // ServeHTTP implements the Service interface.
@@ -110,22 +117,25 @@ func (p Web) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p Web) getPayload() (payload []byte, err error) {
+	webConfig := p.config.Web.Config
 	// render dynamically using config
 
 	// build theme url
 	if themeServer, err := url.Parse(p.config.Web.ThemeServer); err == nil {
-		p.config.Web.Config.Theme = themeServer.String() + p.config.Web.ThemePath
+		webConfig.Theme = themeServer.String() + p.config.Web.ThemePath
 	} else {
-		p.config.Web.Config.Theme = p.config.Web.ThemePath
+		webConfig.Theme = p.config.Web.ThemePath
 	}
 
 	// make apps render as empty array if it is empty
 	// TODO remove once https://github.com/golang/go/issues/27589 is fixed
-	if len(p.config.Web.Config.Apps) == 0 {
-		p.config.Web.Config.Apps = make([]string, 0)
+	if len(webConfig.Apps) == 0 {
+		webConfig.Apps = make([]string, 0)
 	}
-
-	return json.Marshal(p.config.Web.Config)
+	if p.externalApps != nil {
+		webConfig.ExternalApps = append(append([]config.ExternalApp(nil), webConfig.ExternalApps...), p.externalApps()...)
+	}
+	return json.Marshal(webConfig)
 }
 
 // Config implements the Service interface.

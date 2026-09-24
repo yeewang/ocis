@@ -138,6 +138,10 @@ func DefaultPolicies() []config.Policy {
 					Service:  "com.owncloud.web.web",
 				},
 				{
+					Endpoint: "/api/app-store",
+					Service:  "com.owncloud.web.web",
+				},
+				{
 					Endpoint:    "/konnect/",
 					Service:     "com.owncloud.web.idp",
 					Unprotected: true,

@@ -16,6 +16,7 @@ import (
 	"github.com/owncloud/ocis/v2/ocis-pkg/x/io/fsx"
 	"github.com/owncloud/ocis/v2/services/web"
 	"github.com/owncloud/ocis/v2/services/web/pkg/apps"
+	"github.com/owncloud/ocis/v2/services/web/pkg/config"
 	svc "github.com/owncloud/ocis/v2/services/web/pkg/service/v0"
 )
 
@@ -60,11 +61,12 @@ func Server(opts ...Option) (http.Service, error) {
 		fsx.NewBasePathFs(fsx.FromIOFS(web.Assets), "assets/apps"),
 	)
 	// build and inject the list of applications into the config
-	for _, application := range apps.List(options.Logger, options.Config.Apps, appsFS.Secondary().IOFS(), appsFS.Primary().IOFS()) {
-		options.Config.Web.Config.ExternalApps = append(
-			options.Config.Web.Config.ExternalApps,
-			application.ToExternal(path.Join(options.Config.HTTP.Root, _customAppsEndpoint)),
-		)
+	externalApps := func() []config.ExternalApp {
+		result := []config.ExternalApp{}
+		for _, application := range apps.List(options.Logger, options.Config.Apps, appsFS.Secondary().IOFS(), appsFS.Primary().IOFS()) {
+			result = append(result, application.ToExternal(path.Join(options.Config.HTTP.Root, _customAppsEndpoint)))
+		}
+		return result
 	}
 
 	coreFS := fsx.NewFallbackFS(
@@ -91,6 +93,7 @@ func Server(opts ...Option) (http.Service, error) {
 		svc.Logger(options.Logger),
 		svc.CoreFS(coreFS.IOFS()),
 		svc.AppFS(appsFS.IOFS()),
+		svc.ExternalApps(externalApps),
 		svc.ThemeFS(themeFS),
 		svc.AppsHTTPEndpoint(_customAppsEndpoint),
 		svc.Config(options.Config),

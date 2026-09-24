@@ -27,6 +27,11 @@ type Options struct {
 	CoreFS           fs.FS
 	AppFS            fs.FS
 	ThemeFS          *fsx.FallbackFS
+	ExternalApps     func() []config.ExternalApp
+}
+
+func ExternalApps(provider func() []config.ExternalApp) Option {
+	return func(o *Options) { o.ExternalApps = provider }
 }
 
 // newOptions initializes the available default options.
