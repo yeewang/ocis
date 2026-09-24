@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"io"
-	"math"
 	"mime"
 	"os"
 	"path"
@@ -22,6 +21,7 @@ import (
 	"github.com/owncloud/reva/v2/pkg/events"
 	"github.com/owncloud/reva/v2/pkg/storage"
 	"github.com/owncloud/reva/v2/pkg/storage/fs/registry"
+	"github.com/owncloud/reva/v2/pkg/storagespace"
 	"github.com/owncloud/reva/v2/pkg/utils"
 	"github.com/rs/zerolog"
 )
@@ -178,7 +178,10 @@ func (d *Driver) info(ctx context.Context, n nodeRecord) (*provider.ResourceInfo
 	if !p.Stat {
 		return nil, errtypes.NotFound(n.Name)
 	}
-	ri := &provider.ResourceInfo{Id: d.id(n.ID), Name: n.Name, Path: "/" + strings.TrimPrefix(n.Path, "./"), Etag: n.ETag, Mtime: utils.TimeToTS(time.Unix(0, n.Mtime)), Size: uint64(max(n.Size, 0)), Owner: d.owner(), PermissionSet: p, Space: &provider.StorageSpace{Root: d.id(d.s.spaceID)}}
+	ri := &provider.ResourceInfo{Id: d.id(n.ID), Name: n.Name, Path: "/" + strings.TrimPrefix(n.Path, "./"), Etag: n.ETag, Mtime: utils.TimeToTS(time.Unix(0, n.Mtime)), Size: uint64(max(n.Size, 0)), Owner: d.owner(), PermissionSet: p, Space: &provider.StorageSpace{
+		Id:   &provider.StorageSpaceId{OpaqueId: storagespace.FormatStorageID(d.c.MountID, d.s.spaceID)},
+		Root: d.id(d.s.spaceID), Name: d.c.SpaceName, SpaceType: "project", Owner: &userpb.User{Id: d.owner()},
+	}}
 	if n.Parent != "" {
 		ri.ParentId = d.id(n.Parent)
 	} else {
@@ -329,7 +332,7 @@ func (d *Driver) GetPathByID(ctx context.Context, id *provider.ResourceId) (stri
 	return ri.Path, nil
 }
 func (d *Driver) GetQuota(ctx context.Context, ref *provider.Reference) (uint64, uint64, uint64, error) {
-	u, e := d.beginRefs(ctx, lockRef{d.ref(d.s.spaceID), true})
+	u, e := d.beginRefs(ctx, lockRef{d.ref(d.s.spaceID), false})
 	if e != nil {
 		return 0, 0, 0, e
 	}
@@ -341,7 +344,7 @@ func (d *Driver) GetQuota(ctx context.Context, ref *provider.Reference) (uint64,
 	if e != nil {
 		return 0, 0, 0, e
 	}
-	return 0, d.used("."), math.MaxUint64, nil
+	return d.filesystemQuota(ctx)
 }
 
 func (d *Driver) ListStorageSpaces(ctx context.Context, filters []*provider.ListStorageSpacesRequest_Filter, _ bool) ([]*provider.StorageSpace, error) {
@@ -367,10 +370,15 @@ func (d *Driver) ListStorageSpaces(ctx context.Context, filters []*provider.List
 		return nil, e
 	}
 	for _, f := range filters {
-		if id := f.GetId(); id != nil && id.OpaqueId != d.s.spaceID {
-			return []*provider.StorageSpace{}, nil
+		if id := f.GetId(); id != nil {
+			parsed, err := storagespace.ParseID(id.OpaqueId)
+			if err != nil || parsed.SpaceId != d.s.spaceID || parsed.StorageId != "" && parsed.StorageId != d.c.MountID || parsed.OpaqueId != "" && parsed.OpaqueId != d.s.spaceID {
+				return []*provider.StorageSpace{}, nil
+			}
 		}
-		if typ := f.GetSpaceType(); typ != "" && typ != "project" {
+		// These registry modifiers include grants/mountpoints in addition to
+		// the actual space; they are not exclusive space-type filters.
+		if typ := f.GetSpaceType(); typ != "" && typ != "project" && typ != "+grant" && typ != "+mountpoint" {
 			return []*provider.StorageSpace{}, nil
 		}
 	}

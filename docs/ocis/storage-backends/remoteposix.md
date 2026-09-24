@@ -274,10 +274,29 @@ fault injection, not a real remote storage server.
 
 This driver provides a configured project space, not automatic personal-space
 creation or space deletion. It does not implement WebDAV locks, reference mounts,
-TUS concatenation, quotas, or asynchronous upload postprocessing/antivirus. It
+TUS concatenation, configurable quota limits, or asynchronous upload postprocessing/antivirus. It
 does not use the decomposedfs postprocessing coordinator; do not select it for a
 deployment that requires that pipeline. Grants and arbitrary metadata are
 supported; the broader sharing/UI flows still need deployment acceptance tests.
+
+Members can manage sharing when explicitly granted `AddGrant`, `UpdateGrant`,
+`RemoveGrant`, and `ListGrants`. Root grants inherit to descendants. Delegated
+sharing cannot grant permissions the caller lacks or change stronger existing
+grants; replacing a grant requires update permission even through AddGrant.
+Deny grants require `DenyGrant`, including replacing or removing an existing deny.
+The configured owner retains full grant management.
+For managing whole-space membership through Web/Graph, assign the standard
+Manager role: the gateway rejects partial grant-management roles on space roots.
+That role includes file, version, and recycle permissions as well as sharing;
+the current remote driver still restricts recycle management to its configured
+owner. A space Manager is not a server administrator.
+
+Quota reporting uses the remote mount's space available to its filesystem user.
+Used bytes count live files indexed in this Team space; effective total is used
+plus available bytes, not the entire disk size. Files outside the space, trash,
+and versions reduce available capacity without inflating live-file usage. Values
+are bounded to the Graph API's signed 64-bit range. Capacity errors or a missing
+mount return an error rather than reporting unlimited space or local disk space.
 
 Migration of an existing `posix`/`ocis` metadata layout is not automatic: importing
 an existing plain tree creates new IDs. No xattr metadata or old share IDs are
