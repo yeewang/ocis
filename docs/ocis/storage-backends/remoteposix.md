@@ -146,8 +146,12 @@ exported tree are rejected; a scan encountering one stops without committing.
   descendants, replacements, restarts, and trash/restore.
 - Simple and resumable TUS uploads use local staging. Completion copies to a
   temporary remote file, verifies its length, syncs it, and journals the rename.
-  Upload sessions expire after 24 hours and can be purged with storage-users
-  upload maintenance commands.
+  After a successful commit, the local staging copy is removed immediately;
+  the small completion receipt remains available for retries until the session
+  expires after 24 hours. Startup and minute-based maintenance remove leftover
+  completed staging copies and purge expired sessions. Cleanup takes the same
+  session locks as uploads and skips any session referenced by pending recovery
+  operations. A long-running reconciliation can delay the maintenance pass.
 - Overwriting a file retains its previous contents under the control directory.
   Trash and version metadata remain in SQLite. Restore and purge operate on whole
   trash items; partial trash browsing/restoration is not implemented.

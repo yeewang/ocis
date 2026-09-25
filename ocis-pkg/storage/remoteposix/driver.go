@@ -74,6 +74,10 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	d.cancel = cancel
+	// Reclaim local payloads before a potentially long remote-tree scan.
+	if err = d.cleanupUploads(ctx); err != nil {
+		d.log.Warn().Err(err).Msg("upload staging cleanup deferred")
+	}
 	err = s.scan(ctx, c.MissingGrace)
 	if err != nil {
 		s.close()

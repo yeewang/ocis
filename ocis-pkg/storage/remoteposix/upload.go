@@ -485,6 +485,7 @@ func (u *upload) FinishUpload(ctx context.Context) error {
 		return e
 	}
 	if s.Result != "" {
+		d.removeCompletedStage(u.id)
 		return nil
 	}
 	if s.Info.SizeIsDeferred || s.Info.Offset != s.Info.Size {
@@ -503,7 +504,18 @@ func (u *upload) FinishUpload(ctx context.Context) error {
 	if e != nil {
 		return e
 	}
+	_ = f.Close()
+	d.removeCompletedStage(u.id)
 	return nil
+}
+
+// A committed upload keeps its small receipt for retries, not a second copy of
+// its contents. Failure to unlink must not turn a successful commit into failure.
+// The maintenance pass retries cleanup after failures or process crashes.
+func (d *Driver) removeCompletedStage(id string) {
+	if err := os.Remove(d.stage(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		d.log.Warn().Err(err).Str("upload", id).Msg("completed upload staging cleanup deferred")
+	}
 }
 func (d *Driver) Upload(ctx context.Context, req storage.UploadRequest, finished storage.UploadFinishedFunc) (*provider.ResourceInfo, error) {
 	u, e := d.GetUpload(ctx, strings.TrimPrefix(req.Ref.GetPath(), "/"))

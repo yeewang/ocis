@@ -172,6 +172,13 @@ func (s *store) reopen(ctx context.Context) error {
 
 func (d *Driver) maintain(ctx context.Context) {
 	defer close(d.done)
+	cleanup := func() {
+		if err := d.cleanupUploads(ctx); err != nil && ctx.Err() == nil {
+			d.log.Warn().Err(err).Msg("upload staging cleanup deferred")
+		}
+	}
+	staging := time.NewTicker(time.Minute)
+	defer staging.Stop()
 	probe := time.NewTimer(time.Second)
 	defer probe.Stop()
 	scan := time.NewTicker(d.c.ScanInterval)
@@ -182,6 +189,8 @@ func (d *Driver) maintain(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-staging.C:
+			cleanup()
 		case <-probe.C:
 			wasOffline := d.s.offline.Load()
 			leave, err := d.s.enter()
