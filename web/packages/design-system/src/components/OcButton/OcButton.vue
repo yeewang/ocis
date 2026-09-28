@@ -394,6 +394,17 @@ const handlers = computed(() => {
         fill: var(--oc-color-swatch-primary-contrast) !important;
       }
     }
+
+    &-filled:hover:not([disabled]),
+    &-filled:focus:not([disabled]),
+    &-outline:hover:not([disabled]),
+    &-outline:focus:not([disabled]) {
+      color: var(--oc-color-text-inverse) !important;
+
+      span > svg {
+        fill: var(--oc-color-text-inverse) !important;
+      }
+    }
   }
 
   &-success {
@@ -427,6 +438,13 @@ const handlers = computed(() => {
       color: var(--oc-color-swatch-danger-default) !important;
       span > svg {
         fill: var(--oc-color-swatch-danger-default) !important;
+      }
+    }
+
+    &-filled:disabled {
+      color: #ffffff !important;
+      span > svg {
+        fill: #ffffff !important;
       }
     }
   }
